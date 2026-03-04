@@ -523,7 +523,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pick from all markets. By default only 1X2-like outcomes are considered.",
     )
-    auto_cmd.add_argument("--stake", type=float, required=True)
+    auto_cmd.add_argument(
+        "--stake",
+        type=float,
+        default=100.0,
+        help="Stake amount. Defaults to 100.0 for no-subcommand runs.",
+    )
     auto_cmd.add_argument("--currency", default="KES")
     auto_cmd.add_argument("--save-picks", default=None, help="Optional JSON file for picked selections")
     auto_cmd.add_argument(
@@ -693,6 +698,9 @@ def run_auto_bet(client: BetikaClient, args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) == 1:
+        sys.argv.append("auto-bet")
+
     args = parse_args()
 
     paths = ApiPaths(
