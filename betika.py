@@ -8,8 +8,7 @@ Flow:
 4. Fill stake input
 5. Place bet only when --execute is passed
 
-This script uses UI automation and selectors may need updates when Betika changes
-its frontend.
+
 """
 
 from __future__ import annotations
@@ -80,10 +79,10 @@ def parse_args() -> BotConfig:
     parser.add_argument("--login-url", default=os.getenv("BETIKA_LOGIN_URL", DEFAULT_LOGIN_URL))
     parser.add_argument("--username", default=os.getenv("BETIKA_USERNAME", DEFAULT_USERNAME))
     parser.add_argument("--password", default=os.getenv("BETIKA_PASSWORD", DEFAULT_PASSWORD))
-    parser.add_argument("--stake", type=float, default=5.0)
-    parser.add_argument("--count", type=int, default=10)
+    parser.add_argument("--stake", type=float, default=2.0)
+    parser.add_argument("--count", type=int, default=39)
     parser.add_argument("--min-odds", type=float, default=1.01)
-    parser.add_argument("--max-odds", type=float, default=1.5)
+    parser.add_argument("--max-odds", type=float, default=1.35)
     parser.add_argument("--timeout", type=int, default=25)
     parser.add_argument("--max-scrolls", type=int, default=45)
     parser.add_argument("--execute", action="store_true", help="Actually click the Place Bet button")
