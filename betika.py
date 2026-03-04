@@ -143,6 +143,7 @@ class BetikaSeleniumBot:
         self.driver = self._build_driver()
         self.wait = WebDriverWait(self.driver, self.config.timeout)
         self.bet_confirmed = False
+        self.bet_attempted = False
 
     def _build_driver(self) -> WebDriver:
         options = ChromeOptions()
@@ -162,7 +163,7 @@ class BetikaSeleniumBot:
     def close(self) -> None:
         if self.config.keep_open:
             return
-        if self.config.execute and not self.bet_confirmed:
+        if self.bet_attempted and not self.bet_confirmed:
             print("Browser left open because bet confirmation was not detected.")
             return
         self.driver.quit()
@@ -195,9 +196,12 @@ class BetikaSeleniumBot:
             (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]"),
         ]
         for by, selector in candidates:
-            elements = self.driver.find_elements(by, selector)
+            try:
+                elements = self.driver.find_elements(by, selector)
+            except WebDriverException:
+                continue
             for element in elements:
-                if element.is_displayed():
+                if self._is_displayed_safe(element):
                     self._safe_click(element)
                     time.sleep(0.4)
                     return
@@ -296,8 +300,12 @@ class BetikaSeleniumBot:
             ),
         ]
         for by, selector in not_logged_in_markers:
-            for el in self.driver.find_elements(by, selector):
-                if el.is_displayed():
+            try:
+                elements = self.driver.find_elements(by, selector)
+            except WebDriverException:
+                continue
+            for el in elements:
+                if self._is_displayed_safe(el):
                     return False
 
         # Stronger logged-in indicators.
@@ -325,8 +333,12 @@ class BetikaSeleniumBot:
         ]
         matched = 0
         for by, selector in indicators:
-            for el in self.driver.find_elements(by, selector):
-                if el.is_displayed():
+            try:
+                elements = self.driver.find_elements(by, selector)
+            except WebDriverException:
+                continue
+            for el in elements:
+                if self._is_displayed_safe(el):
                     matched += 1
                     break
 
@@ -336,8 +348,15 @@ class BetikaSeleniumBot:
     def _wait_until_logged_in(self, timeout: int) -> bool:
         end = time.time() + timeout
         while time.time() < end:
-            if self._is_logged_in():
-                return True
+            try:
+                if self._is_logged_in():
+                    return True
+            except StaleElementReferenceException:
+                time.sleep(0.2)
+                continue
+            except WebDriverException:
+                time.sleep(0.2)
+                continue
             if "/login" not in self.driver.current_url:
                 return True
             time.sleep(0.5)
@@ -469,6 +488,7 @@ class BetikaSeleniumBot:
         )
         if button is None:
             raise BotError("Could not find Place Bet button.")
+        self.bet_attempted = True
         clicked = self._safe_click(button)
         if not clicked:
             raise BotError("Place Bet button became stale before click.")
@@ -579,7 +599,7 @@ class BetikaSeleniumBot:
                 except WebDriverException:
                     continue
                 for element in elements:
-                    if element.is_displayed():
+                    if self._is_displayed_safe(element):
                         candidates.append(element)
 
             if prefer_right_panel and candidates:
@@ -599,6 +619,14 @@ class BetikaSeleniumBot:
             time.sleep(0.25)
 
         return None
+
+    def _is_displayed_safe(self, element: WebElement) -> bool:
+        try:
+            return element.is_displayed()
+        except StaleElementReferenceException:
+            return False
+        except WebDriverException:
+            return False
 
     def _safe_click(self, element: WebElement) -> bool:
         try:
@@ -685,6 +713,12 @@ def main() -> int:
         return 0
     except BotError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except StaleElementReferenceException:
+        print(
+            "ERROR: Page refreshed while elements were being read. Please run the command again.",
+            file=sys.stderr,
+        )
         return 1
     except TimeoutException as exc:
         print(f"ERROR: Timed out waiting for page elements: {exc}", file=sys.stderr)
