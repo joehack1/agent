@@ -477,29 +477,110 @@ class BetikaSeleniumBot:
         print(f"Stake set to {stake}.")
 
     def _place_bet(self) -> str:
+        self.bet_attempted = True
+        deadline = time.time() + self.config.timeout + 15
+        click_count = 0
+
+        while time.time() < deadline:
+            removed = self._click_remove_expired()
+            if removed:
+                time.sleep(0.7)
+                confirmation = self._wait_for_bet_confirmation(timeout=2)
+                if confirmation:
+                    return confirmation
+                continue
+
+            button, label = self._find_place_bet_action()
+            if button is None:
+                confirmation = self._wait_for_bet_confirmation(timeout=2)
+                if confirmation:
+                    return confirmation
+                time.sleep(0.4)
+                continue
+
+            clicked = self._safe_click(button)
+            if not clicked:
+                time.sleep(0.2)
+                continue
+
+            click_count += 1
+            print(f"{label} clicked ({click_count}). Waiting for confirmation...")
+
+            confirmation = self._wait_for_bet_confirmation(timeout=4)
+            if confirmation:
+                return confirmation
+
+            # If confirmation is delayed or odds changed, loop and retry action.
+            time.sleep(0.5)
+
+        raise BotError("Bet action was clicked but no final confirmation was detected.")
+
+    def _click_remove_expired(self) -> bool:
+        remove_locators = [
+            (
+                By.XPATH,
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'remove') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'expired')]",
+            ),
+            (
+                By.XPATH,
+                "//*[@role='button' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'remove') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'expired')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'remove expired')]",
+            ),
+        ]
         button = self._find_first_visible(
-            [
-                (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'place bet')]") ,
-                (By.XPATH, "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'place bet') and (@role='button' or self::button)]"),
-            ],
-            timeout=10,
+            remove_locators,
+            timeout=1,
             prefer_right_panel=True,
         )
         if button is None:
-            raise BotError("Could not find Place Bet button.")
-        self.bet_attempted = True
-        clicked = self._safe_click(button)
-        if not clicked:
-            raise BotError("Place Bet button became stale before click.")
+            return False
+        if not self._safe_click(button):
+            return False
+        print("Clicked remove expired selections.")
+        return True
 
-        print("Place Bet clicked, waiting for confirmation...")
-        confirmation_text = self._wait_for_bet_confirmation(timeout=self.config.timeout)
-        if confirmation_text:
-            return confirmation_text
+    def _find_place_bet_action(self) -> tuple[WebElement | None, str]:
+        accept_then_place = [
+            (
+                By.XPATH,
+                "//button[(contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'place bet')) or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept & place bet')]",
+            ),
+            (
+                By.XPATH,
+                "//*[(@role='button' or self::button) and ((contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept') and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'place bet')) or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept & place bet'))]",
+            ),
+        ]
+        place_only = [
+            (
+                By.XPATH,
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'place bet')]",
+            ),
+            (
+                By.XPATH,
+                "//*[(@role='button' or self::button) and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'place bet')]",
+            ),
+        ]
 
-        raise BotError(
-            "Place Bet was clicked but no confirmation was detected within timeout."
+        button = self._find_first_visible(
+            accept_then_place,
+            timeout=1,
+            prefer_right_panel=True,
         )
+        if button is not None:
+            return button, "Accept and Place Bet"
+
+        button = self._find_first_visible(
+            place_only,
+            timeout=1,
+            prefer_right_panel=True,
+        )
+        if button is not None:
+            return button, "Place Bet"
+
+        return None, ""
 
     def _wait_for_bet_confirmation(self, timeout: int) -> str | None:
         success_locators = [
@@ -523,6 +604,10 @@ class BetikaSeleniumBot:
                 By.XPATH,
                 "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'receipt')]",
             ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accepted')]",
+            ),
         ]
         error_locators = [
             (
@@ -531,29 +616,33 @@ class BetikaSeleniumBot:
             ),
             (
                 By.XPATH,
-                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'failed')]",
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'minimum stake')]",
             ),
             (
                 By.XPATH,
-                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rejected')]",
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'maximum stake')]",
             ),
             (
                 By.XPATH,
-                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'error')]",
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'market suspended')]",
             ),
             (
                 By.XPATH,
-                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'odds changed')]",
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'selection is no longer available')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'session expired')]",
             ),
         ]
 
         end = time.time() + timeout
         while time.time() < end:
-            error_text = self._find_visible_text(error_locators)
+            error_text = self._find_visible_text(error_locators, prefer_right_panel=True)
             if error_text:
                 raise BotError(f"Bet rejected: {error_text}")
 
-            success_text = self._find_visible_text(success_locators)
+            success_text = self._find_visible_text(success_locators, prefer_right_panel=True)
             if success_text:
                 return success_text
 
@@ -564,7 +653,17 @@ class BetikaSeleniumBot:
 
         return None
 
-    def _find_visible_text(self, locators: Iterable[tuple[str, str]]) -> str | None:
+    def _find_visible_text(
+        self, locators: Iterable[tuple[str, str]], prefer_right_panel: bool = False
+    ) -> str | None:
+        right_threshold = None
+        if prefer_right_panel:
+            try:
+                window_width = self.driver.execute_script("return window.innerWidth")
+                right_threshold = float(window_width) * 0.58
+            except WebDriverException:
+                right_threshold = None
+
         for by, selector in locators:
             try:
                 elements = self.driver.find_elements(by, selector)
@@ -573,12 +672,22 @@ class BetikaSeleniumBot:
 
             for element in elements:
                 try:
-                    if not element.is_displayed():
+                    if not self._is_displayed_safe(element):
                         continue
+                    if right_threshold is not None:
+                        rect = element.rect
+                        center_x = rect.get("x", 0) + (rect.get("width", 0) / 2)
+                        if center_x < right_threshold:
+                            continue
                     text = " ".join((element.text or "").split())
+                    # Ignore giant containers (like full page body) that produce false positives.
+                    if len(text) > 280:
+                        continue
                     if text:
                         return text
                 except StaleElementReferenceException:
+                    continue
+                except WebDriverException:
                     continue
 
         return None
