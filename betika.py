@@ -24,7 +24,11 @@ from typing import Iterable
 
 try:
     from selenium import webdriver
-    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from selenium.common.exceptions import (
+        StaleElementReferenceException,
+        TimeoutException,
+        WebDriverException,
+    )
     from selenium.webdriver import ChromeOptions
     from selenium.webdriver.chrome.webdriver import WebDriver
     from selenium.webdriver.common.by import By
@@ -64,6 +68,8 @@ class BotConfig:
     headless: bool
     keep_open: bool
     only_1x2: bool
+    manual_login_wait: int
+    debug_login: bool
 
 
 def parse_args() -> BotConfig:
@@ -74,8 +80,8 @@ def parse_args() -> BotConfig:
     parser.add_argument("--login-url", default=os.getenv("BETIKA_LOGIN_URL", DEFAULT_LOGIN_URL))
     parser.add_argument("--username", default=os.getenv("BETIKA_USERNAME", DEFAULT_USERNAME))
     parser.add_argument("--password", default=os.getenv("BETIKA_PASSWORD", DEFAULT_PASSWORD))
-    parser.add_argument("--stake", type=float, default=100.0)
-    parser.add_argument("--count", type=int, default=30)
+    parser.add_argument("--stake", type=float, default=5.0)
+    parser.add_argument("--count", type=int, default=10)
     parser.add_argument("--min-odds", type=float, default=1.01)
     parser.add_argument("--max-odds", type=float, default=1.5)
     parser.add_argument("--timeout", type=int, default=25)
@@ -83,6 +89,17 @@ def parse_args() -> BotConfig:
     parser.add_argument("--execute", action="store_true", help="Actually click the Place Bet button")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--keep-open", action="store_true", help="Do not close browser after run")
+    parser.add_argument(
+        "--manual-login-wait",
+        type=int,
+        default=90,
+        help="Seconds to wait for manual login if auto-login does not complete.",
+    )
+    parser.add_argument(
+        "--debug-login",
+        action="store_true",
+        help="Save login page screenshot/source when auto-login fails.",
+    )
     parser.add_argument(
         "--all-markets",
         action="store_true",
@@ -115,6 +132,8 @@ def parse_args() -> BotConfig:
         headless=args.headless,
         keep_open=args.keep_open,
         only_1x2=not args.all_markets,
+        manual_login_wait=args.manual_login_wait,
+        debug_login=args.debug_login,
     )
 
 
@@ -123,6 +142,7 @@ class BetikaSeleniumBot:
         self.config = config
         self.driver = self._build_driver()
         self.wait = WebDriverWait(self.driver, self.config.timeout)
+        self.bet_confirmed = False
 
     def _build_driver(self) -> WebDriver:
         options = ChromeOptions()
@@ -140,8 +160,12 @@ class BetikaSeleniumBot:
             ) from exc
 
     def close(self) -> None:
-        if not self.config.keep_open:
-            self.driver.quit()
+        if self.config.keep_open:
+            return
+        if self.config.execute and not self.bet_confirmed:
+            print("Browser left open because bet confirmation was not detected.")
+            return
+        self.driver.quit()
 
     def run(self) -> None:
         self.driver.get(self.config.login_url)
@@ -159,8 +183,9 @@ class BetikaSeleniumBot:
         self._set_stake(self.config.stake)
 
         if self.config.execute:
-            self._place_bet()
-            print("Place Bet clicked.")
+            confirmation_text = self._place_bet()
+            self.bet_confirmed = True
+            print(f"Bet confirmed: {confirmation_text}")
         else:
             print("Dry-run mode: selections added and stake set, but Place Bet was not clicked.")
 
@@ -258,16 +283,55 @@ class BetikaSeleniumBot:
         print("Login successful.")
 
     def _is_logged_in(self) -> bool:
-        indicators = [
-            (By.XPATH, "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'profile')]") ,
-            (By.XPATH, "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'my bets')]") ,
-            (By.XPATH, "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'deposit')]") ,
+        # If login form or login CTA is visible, user is not authenticated yet.
+        not_logged_in_markers = [
+            (By.CSS_SELECTOR, "input[type='password']"),
+            (
+                By.XPATH,
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login') or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]",
+            ),
+            (
+                By.XPATH,
+                "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login') or contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]",
+            ),
         ]
+        for by, selector in not_logged_in_markers:
+            for el in self.driver.find_elements(by, selector):
+                if el.is_displayed():
+                    return False
+
+        # Stronger logged-in indicators.
+        indicators = [
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'logout')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'my bets')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'profile')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'balance')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'notifications')]",
+            ),
+        ]
+        matched = 0
         for by, selector in indicators:
             for el in self.driver.find_elements(by, selector):
                 if el.is_displayed():
-                    return True
-        return False
+                    matched += 1
+                    break
+
+        # Require at least two independent indicators to avoid false positives.
+        return matched >= 2
 
     def _wait_until_logged_in(self, timeout: int) -> bool:
         end = time.time() + timeout
@@ -283,27 +347,35 @@ class BetikaSeleniumBot:
         clicked_ids: set[str] = set()
         picked: list[dict[str, str | float]] = []
 
-        for _ in range(self.config.max_scrolls):
+        for scroll_step in range(self.config.max_scrolls):
             new_clicks = 0
             buttons = self._find_low_odd_buttons()
             for button, odd, label in buttons:
-                if button.id in clicked_ids:
-                    continue
-                if self._is_already_selected(button):
-                    clicked_ids.add(button.id)
-                    continue
+                try:
+                    if button.id in clicked_ids:
+                        continue
+                    if self._is_already_selected(button):
+                        clicked_ids.add(button.id)
+                        continue
 
-                self._safe_click(button)
-                clicked_ids.add(button.id)
-                picked.append({"odd": odd, "label": label})
-                new_clicks += 1
-                print(f"Picked {len(picked)}/{self.config.count}: {label} @ {odd:.2f}")
-                time.sleep(0.15)
+                    clicked = self._safe_click(button)
+                    if not clicked:
+                        continue
+                    clicked_ids.add(button.id)
+                    picked.append({"odd": odd, "label": label})
+                    new_clicks += 1
+                    print(f"Picked {len(picked)}/{self.config.count}: {label} @ {odd:.2f}")
+                    time.sleep(0.15)
+                except StaleElementReferenceException:
+                    continue
 
                 if len(picked) >= self.config.count:
                     return picked
 
             if new_clicks == 0:
+                print(
+                    f"Scroll step {scroll_step + 1}: no new picks from {len(buttons)} candidates, scrolling..."
+                )
                 self.driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight * 0.85));")
                 time.sleep(0.7)
             else:
@@ -314,9 +386,10 @@ class BetikaSeleniumBot:
 
     def _find_low_odd_buttons(self) -> list[tuple[WebElement, float, str]]:
         selectors: list[tuple[str, str]] = [
+            (By.CSS_SELECTOR, "[data-odd], [data-odds], [class*='odd-btn'], button[class*='odd']"),
+            (By.CSS_SELECTOR, "[class*='outcome'] button, [class*='market'] button"),
             (By.CSS_SELECTOR, "button"),
             (By.CSS_SELECTOR, "[role='button']"),
-            (By.CSS_SELECTOR, ".odd-btn, [class*='odd'], [class*='market'] button"),
         ]
 
         window_width = self.driver.execute_script("return window.innerWidth")
@@ -327,37 +400,45 @@ class BetikaSeleniumBot:
         for by, selector in selectors:
             elements = self.driver.find_elements(by, selector)
             for element in elements:
-                if element.id in seen:
-                    continue
-                seen.add(element.id)
+                try:
+                    if element.id in seen:
+                        continue
+                    seen.add(element.id)
 
-                if not element.is_displayed() or not element.is_enabled():
-                    continue
+                    if not element.is_displayed() or not element.is_enabled():
+                        continue
 
-                rect = element.rect
-                center_x = rect.get("x", 0) + rect.get("width", 0) / 2
-                if center_x > max_main_x:
-                    continue
+                    rect = element.rect
+                    center_x = rect.get("x", 0) + rect.get("width", 0) / 2
+                    if center_x > max_main_x:
+                        continue
 
-                text = (element.text or "").strip()
-                odd = parse_odd(text)
-                if odd is None:
-                    continue
-                if odd < self.config.min_odds or odd > self.config.max_odds:
-                    continue
-                if rect.get("width", 0) < 24 or rect.get("height", 0) < 18:
-                    continue
+                    text = (element.text or "").strip()
+                    odd = parse_odd(text)
+                    if odd is None:
+                        continue
+                    if odd < self.config.min_odds or odd > self.config.max_odds:
+                        continue
+                    if rect.get("width", 0) < 24 or rect.get("height", 0) < 18:
+                        continue
 
-                label = text.replace("\n", " ")
-                if self.config.only_1x2 and not looks_like_1x2(label):
-                    continue
+                    label = text.replace("\n", " ")
+                    if self.config.only_1x2 and not looks_like_1x2(label):
+                        continue
 
-                found.append((element, odd, label))
+                    found.append((element, odd, label))
+                except StaleElementReferenceException:
+                    continue
+                except WebDriverException:
+                    continue
 
         return found
 
     def _is_already_selected(self, element: WebElement) -> bool:
-        class_name = (element.get_attribute("class") or "").lower()
+        try:
+            class_name = (element.get_attribute("class") or "").lower()
+        except StaleElementReferenceException:
+            return True
         selected_tokens = ("selected", "active", "picked", "highlight")
         return any(token in class_name for token in selected_tokens)
 
@@ -377,7 +458,7 @@ class BetikaSeleniumBot:
         self._set_input_value(stake_input, str(int(stake) if float(stake).is_integer() else stake))
         print(f"Stake set to {stake}.")
 
-    def _place_bet(self) -> None:
+    def _place_bet(self) -> str:
         button = self._find_first_visible(
             [
                 (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'place bet')]") ,
@@ -388,7 +469,100 @@ class BetikaSeleniumBot:
         )
         if button is None:
             raise BotError("Could not find Place Bet button.")
-        self._safe_click(button)
+        clicked = self._safe_click(button)
+        if not clicked:
+            raise BotError("Place Bet button became stale before click.")
+
+        print("Place Bet clicked, waiting for confirmation...")
+        confirmation_text = self._wait_for_bet_confirmation(timeout=self.config.timeout)
+        if confirmation_text:
+            return confirmation_text
+
+        raise BotError(
+            "Place Bet was clicked but no confirmation was detected within timeout."
+        )
+
+    def _wait_for_bet_confirmation(self, timeout: int) -> str | None:
+        success_locators = [
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'bet placed')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'successfully')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'booking code')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'bet id')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'receipt')]",
+            ),
+        ]
+        error_locators = [
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'insufficient balance')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'failed')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'rejected')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'error')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'odds changed')]",
+            ),
+        ]
+
+        end = time.time() + timeout
+        while time.time() < end:
+            error_text = self._find_visible_text(error_locators)
+            if error_text:
+                raise BotError(f"Bet rejected: {error_text}")
+
+            success_text = self._find_visible_text(success_locators)
+            if success_text:
+                return success_text
+
+            if "/my-bets" in self.driver.current_url.lower():
+                return "navigated to My Bets page"
+
+            time.sleep(0.4)
+
+        return None
+
+    def _find_visible_text(self, locators: Iterable[tuple[str, str]]) -> str | None:
+        for by, selector in locators:
+            try:
+                elements = self.driver.find_elements(by, selector)
+            except WebDriverException:
+                continue
+
+            for element in elements:
+                try:
+                    if not element.is_displayed():
+                        continue
+                    text = " ".join((element.text or "").split())
+                    if text:
+                        return text
+                except StaleElementReferenceException:
+                    continue
+
+        return None
 
     def _find_first_visible(
         self,
@@ -426,15 +600,24 @@ class BetikaSeleniumBot:
 
         return None
 
-    def _safe_click(self, element: WebElement) -> None:
-        self.driver.execute_script(
-            "arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", element
-        )
+    def _safe_click(self, element: WebElement) -> bool:
         try:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", element
+            )
             self.wait.until(EC.element_to_be_clickable(element))
             element.click()
+            return True
+        except StaleElementReferenceException:
+            return False
         except Exception:
-            self.driver.execute_script("arguments[0].click();", element)
+            try:
+                self.driver.execute_script("arguments[0].click();", element)
+                return True
+            except StaleElementReferenceException:
+                return False
+            except WebDriverException:
+                return False
 
     def _set_input_value(self, element: WebElement, value: str) -> None:
         element.click()
@@ -453,20 +636,44 @@ def parse_odd(text: str) -> float | None:
         return None
 
     compact = " ".join(text.replace("\n", " ").split())
-    match = re.search(r"\b(\d+(?:[.,]\d+)?)\b", compact)
-    if not match:
+    raw_numbers = re.findall(r"\b\d+(?:[.,]\d+)?\b", compact)
+    if not raw_numbers:
         return None
 
-    try:
-        return float(match.group(1).replace(",", "."))
-    except ValueError:
+    parsed: list[tuple[str, float]] = []
+    for raw in raw_numbers:
+        try:
+            parsed.append((raw, float(raw.replace(",", "."))))
+        except ValueError:
+            continue
+
+    if not parsed:
         return None
+
+    # Odds chips often look like "1 1.48", where the first token is outcome label.
+    # Prefer decimal-looking tokens and return the last plausible one.
+    decimal_values = [value for raw, value in parsed if "." in raw or "," in raw]
+    candidates = decimal_values or [value for _, value in parsed]
+    plausible = [value for value in candidates if 1.01 <= value <= 1000]
+    if plausible:
+        return plausible[-1]
+    return candidates[-1]
 
 
 def looks_like_1x2(label: str) -> bool:
-    normalized = label.lower().replace(" ", "")
-    tokens = {"1", "x", "2", "1x2", "home", "draw", "away"}
-    return normalized in tokens or normalized.startswith("1x2")
+    compact = " ".join(label.lower().split())
+    normalized = compact.replace(" ", "")
+
+    if "1x2" in normalized or "matchresult" in normalized:
+        return True
+
+    # Many homepage odds chips are just a single odd value under 1/X/2 columns.
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", compact):
+        return True
+
+    tokens = re.findall(r"[a-z]+|x|\d+", normalized)
+    accepted = {"1", "x", "2", "home", "draw", "away"}
+    return any(token in accepted for token in tokens)
 
 
 def main() -> int:
