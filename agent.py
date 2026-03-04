@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 import chromadb
 import sys
+import os
 from typing import List, Dict, Optional
 
 try:
@@ -19,6 +20,23 @@ class FreeWebsiteBot:
         self.model = SentenceTransformer(model_name)
         self.chroma_client = chromadb.PersistentClient(path="./free_website_knowledge")
         self.collection = None
+        self.playwright_enabled = sync_playwright is not None
+        self.playwright_failures = 0
+        self.max_playwright_failures = self._read_int_env(
+            "CRAWL_PLAYWRIGHT_MAX_FAILURES", 2
+        )
+        self.request_timeout_s = self._read_float_env("CRAWL_REQUEST_TIMEOUT_S", 10.0)
+        self.playwright_goto_timeout_ms = self._read_int_env(
+            "CRAWL_PLAYWRIGHT_GOTO_TIMEOUT_MS", 12000
+        )
+        self.playwright_networkidle_timeout_ms = self._read_int_env(
+            "CRAWL_PLAYWRIGHT_NETWORKIDLE_TIMEOUT_MS", 2500
+        )
+        self.playwright_settle_wait_ms = self._read_int_env(
+            "CRAWL_PLAYWRIGHT_SETTLE_WAIT_MS", 300
+        )
+        if os.getenv("CRAWL_USE_PLAYWRIGHT", "1").strip().lower() in {"0", "false", "no"}:
+            self.playwright_enabled = False
 
         # Retry transient HTTP errors and use a browser-like user agent.
         retries = Retry(
@@ -40,6 +58,18 @@ class FreeWebsiteBot:
                 )
             }
         )
+
+    def _read_int_env(self, name: str, default: int) -> int:
+        try:
+            return int(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+
+    def _read_float_env(self, name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
 
     def _candidate_urls(self, url: str) -> List[str]:
         """Try HTTPS first, then fallback to HTTP for misconfigured hosts."""
@@ -73,27 +103,72 @@ class FreeWebsiteBot:
         )
 
     def _crawl_page_with_playwright(self, url: str) -> Optional[Dict]:
-        if sync_playwright is None:
+        if (
+            sync_playwright is None
+            or not self.playwright_enabled
+            or self.playwright_failures >= self.max_playwright_failures
+        ):
             return None
 
+        browser = None
+        context = None
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context(user_agent=self.session.headers.get("User-Agent"))
-                page = context.new_page()
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except PlaywrightTimeoutError:
-                    pass
-                page.wait_for_timeout(1500)
-                html = page.content()
-                browser.close()
+                    browser = p.chromium.launch(headless=True)
+                    context = browser.new_context(
+                        user_agent=self.session.headers.get("User-Agent")
+                    )
+                    page = context.new_page()
+                    page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=self.playwright_goto_timeout_ms,
+                    )
+                    try:
+                        page.wait_for_load_state(
+                            "networkidle",
+                            timeout=self.playwright_networkidle_timeout_ms,
+                        )
+                    except PlaywrightTimeoutError:
+                        pass
+                    if self.playwright_settle_wait_ms > 0:
+                        page.wait_for_timeout(self.playwright_settle_wait_ms)
+                    html = page.content()
+                finally:
+                    if context is not None:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                    if browser is not None:
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
             page_data = self._extract_page_data(html, url)
             if page_data["content"]:
                 print(f"Fetched rendered content with Playwright for {url}")
             return page_data
-        except Exception:
+        except PlaywrightTimeoutError:
+            self.playwright_failures += 1
+            print(
+                f"Playwright timed out for {url} "
+                f"({self.playwright_failures}/{self.max_playwright_failures})."
+            )
+            if self.playwright_failures >= self.max_playwright_failures:
+                self.playwright_enabled = False
+                print("Playwright disabled for this run after repeated failures.")
+            return None
+        except Exception as e:
+            self.playwright_failures += 1
+            print(
+                f"Playwright failed for {url}: {e} "
+                f"({self.playwright_failures}/{self.max_playwright_failures})."
+            )
+            if self.playwright_failures >= self.max_playwright_failures:
+                self.playwright_enabled = False
+                print("Playwright disabled for this run after repeated failures.")
             return None
 
     def crawl_page(self, url: str) -> Optional[Dict]:
@@ -101,7 +176,7 @@ class FreeWebsiteBot:
         last_error = None
         for candidate in self._candidate_urls(url):
             try:
-                response = self.session.get(candidate, timeout=15)
+                response = self.session.get(candidate, timeout=self.request_timeout_s)
                 response.raise_for_status()
                 page_data = self._extract_page_data(response.text, candidate)
                 if self._looks_like_js_placeholder(page_data["content"]):
@@ -242,7 +317,11 @@ def main_free():
     ]
     
     # Train the bot
-    learned_chunks = bot.learn_from_websites(urls)
+    try:
+        learned_chunks = bot.learn_from_websites(urls)
+    except KeyboardInterrupt:
+        print("\nInterrupted while indexing websites. Exiting.")
+        return
     if learned_chunks == 0:
         print(
             "No website content indexed. Update URL(s) or retry, then ask questions."
@@ -250,7 +329,11 @@ def main_free():
     
     # Query
     while True:
-        question = input("\nAsk: ")
+        try:
+            question = input("\nAsk: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
         if question.lower() == 'quit':
             break
             
