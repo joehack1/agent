@@ -6,7 +6,8 @@ from sentence_transformers import SentenceTransformer
 import chromadb
 import sys
 import os
-from typing import List, Dict, Optional
+import re
+from typing import List, Dict, Optional, Set
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -35,6 +36,7 @@ class FreeWebsiteBot:
         self.playwright_settle_wait_ms = self._read_int_env(
             "CRAWL_PLAYWRIGHT_SETTLE_WAIT_MS", 300
         )
+        self.answer_sentence_limit = self._read_int_env("ANSWER_SENTENCE_LIMIT", 2)
         if os.getenv("CRAWL_USE_PLAYWRIGHT", "1").strip().lower() in {"0", "false", "no"}:
             self.playwright_enabled = False
 
@@ -85,7 +87,9 @@ class FreeWebsiteBot:
         text = soup.get_text()
         lines = (line.strip() for line in text.splitlines())
         chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        return " ".join(chunk for chunk in chunks if chunk)
+        cleaned = " ".join(chunk for chunk in chunks if chunk)
+        cleaned = cleaned.replace("```", " ")
+        return re.sub(r"\s+", " ", cleaned).strip()
 
     def _extract_page_data(self, html: str, source_url: str) -> Dict:
         soup = BeautifulSoup(html, "html.parser")
@@ -193,7 +197,7 @@ class FreeWebsiteBot:
         print(f"Error crawling {url}: {last_error}")
         return None
     
-    def chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+    def chunk_text(self, text: str, chunk_size: int = 220, overlap: int = 30) -> List[str]:
         """Split text into overlapping chunks"""
         words = text.split()
         chunks = []
@@ -205,6 +209,108 @@ class FreeWebsiteBot:
                 chunks.append(chunk)
             
         return chunks
+
+    def _extract_keywords(self, text: str) -> Set[str]:
+        stopwords = {
+            "a", "about", "an", "and", "are", "as", "at", "be", "by", "for",
+            "from", "how", "i", "in", "is", "it", "of", "on", "or", "that",
+            "the", "this", "to", "was", "what", "when", "where", "which", "who",
+            "why", "with", "you", "your",
+        }
+        tokens = re.findall(r"[a-z0-9]+", text.lower())
+        return {token for token in tokens if len(token) > 2 and token not in stopwords}
+
+    def _split_into_passages(self, text: str) -> List[str]:
+        raw_parts = re.split(r"[\r\n]+|(?<=[.!?])\s+", text)
+        segments: List[str] = []
+
+        for part in raw_parts:
+            cleaned = re.sub(r"\s+", " ", part).strip("`*#>- ").strip()
+            if not cleaned:
+                continue
+
+            words = cleaned.split()
+            if len(words) > 55:
+                for i in range(0, len(words), 45):
+                    segment = " ".join(words[i : i + 45]).strip()
+                    if segment:
+                        segments.append(segment)
+            else:
+                segments.append(cleaned)
+
+        unique_segments: List[str] = []
+        seen = set()
+        for segment in segments:
+            if len(segment) < 45 or len(segment) > 280:
+                continue
+            if not any(char in segment for char in ".,?!"):
+                continue
+            words = segment.split()
+            if not words:
+                continue
+            uppercase_words = sum(1 for word in words if word.isupper() and len(word) > 2)
+            if uppercase_words / len(words) > 0.25:
+                continue
+            key = segment.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_segments.append(segment)
+
+        return unique_segments
+
+    def _extract_bio_line(self, documents: List[str]) -> Optional[str]:
+        text = re.sub(r"\s+", " ", " ".join(documents)).strip()
+        patterns = [
+            r"(I'm\s+[^.]{20,220}\.)",
+            r"(I am\s+[^.]{20,220}\.)",
+            r"([A-Z][a-z]+ [A-Z][a-z]+ \([^)]+\), a [^.]{20,220}\.)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                return match.group(1).strip()
+        return None
+
+    def _extract_relevant_sentences(
+        self, question: str, documents: List[str], limit: int = 3
+    ) -> List[str]:
+        candidates: List[str] = []
+        for document in documents:
+            candidates.extend(self._split_into_passages(document))
+
+        if not candidates:
+            return []
+
+        candidates = candidates[:250]
+        question_embedding = self.model.encode([question], normalize_embeddings=True)[0]
+        candidate_embeddings = self.model.encode(candidates, normalize_embeddings=True)
+        semantic_scores = candidate_embeddings @ question_embedding
+        question_keywords = self._extract_keywords(question)
+
+        scored_candidates = []
+        for index, candidate in enumerate(candidates):
+            lexical_score = 0.0
+            if question_keywords:
+                candidate_words = set(re.findall(r"[a-z0-9]+", candidate.lower()))
+                lexical_score = len(question_keywords & candidate_words) / len(question_keywords)
+            combined_score = float(semantic_scores[index]) + (0.2 * lexical_score)
+            scored_candidates.append((combined_score, candidate))
+
+        scored_candidates.sort(key=lambda item: item[0], reverse=True)
+
+        selected = []
+        seen = set()
+        for _, candidate in scored_candidates:
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(candidate)
+            if len(selected) >= max(limit, 1):
+                break
+
+        return selected
     
     def create_collection(self, collection_name: str = "website_content"):
         """Create or get ChromaDB collection"""
@@ -265,7 +371,7 @@ class FreeWebsiteBot:
         )
         return len(all_chunks)
         
-    def query(self, question: str, n_results: int = 3) -> List[Dict]:
+    def query(self, question: str, n_results: int = 5) -> Dict:
         """Query the learned content"""
         if self.collection is None:
             return {"documents": [[]], "metadatas": [[]], "ids": [[]]}
@@ -291,15 +397,47 @@ class FreeWebsiteBot:
         
         if not results['documents'][0]:
             return "I couldn't find relevant information about that on the website."
-        
-        # Combine retrieved chunks
-        context = "\n\n".join(results['documents'][0])
-        sources = set([m['url'] for m in results['metadatas'][0]])
-        
-        # Simple response generation (for better responses, integrate with free LLM like Llama)
-        response = f"Based on the website content:\n\n{context}\n\n"
-        response += f"Sources: {', '.join(sources)}"
-        
+
+        documents = results["documents"][0]
+        lowered_question = question.strip().lower()
+        identity_question = lowered_question.startswith("who is") or lowered_question.startswith("who's")
+        sentences = self._extract_relevant_sentences(
+            question, documents, limit=self.answer_sentence_limit
+        )
+        sources = sorted(
+            {
+                metadata["url"]
+                for metadata in results["metadatas"][0]
+                if metadata and metadata.get("url")
+            }
+        )
+
+        if identity_question:
+            bio_line = self._extract_bio_line(documents)
+            if bio_line:
+                response = f"Based on indexed content:\n- {bio_line}"
+            elif sentences:
+                response = "Based on indexed content:\n"
+                response += "\n".join(f"- {sentence}" for sentence in sentences[:1])
+            else:
+                words = documents[0].split()
+                fallback = " ".join(words[:40]).strip()
+                if len(words) > 40:
+                    fallback += "..."
+                response = f"Based on indexed content: {fallback}"
+        elif not sentences:
+            words = documents[0].split()
+            fallback = " ".join(words[:40]).strip()
+            if len(words) > 40:
+                fallback += "..."
+            response = f"Based on indexed content: {fallback}"
+        else:
+            response = "Based on indexed content:\n"
+            response += "\n".join(f"- {sentence}" for sentence in sentences)
+
+        if sources:
+            response += f"\n\nSources: {', '.join(sources)}"
+
         return response
 
 # Usage
